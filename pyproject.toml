@@ -1,0 +1,18 @@
+[project]
+name = "durable-agent-orchestration-lab"
+version = "0.1.0"
+description = "A LangGraph, MCP, and durable execution lab for macro research agents"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0.0",
+    "fastapi",
+    "langgraph",
+    "langgraph-checkpoint-sqlite>=3.0.1",
+    "uvicorn",
+    "httpx",
+    "python-dotenv",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
