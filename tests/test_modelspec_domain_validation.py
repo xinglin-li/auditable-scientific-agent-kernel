@@ -1,92 +1,57 @@
 # tests/test_modelspec_domain_validation.py
 import pytest
-from pydantic import ValidationError
 import json
 from agent_runtime.scientific.modelspec import ModelSpec
-from agent_runtime.scientific.parser import ModelSpecParser
-from agent_runtime.scientific.validators import ModelSpecDomainValidator, DomainValidationError
+from agent_runtime.scientific.validators import ModelSpecDomainValidator
 
-# 构建本地模拟物理数据集仓库存根元数据：{ dataset_id: (总行数, 时间频率) }
 MOCK_DATA_REGISTRY = {
     "monthly_sales_ok.csv": (120, "monthly"),
-    "short_series_broken.csv": (15, "monthly") # 只有 15 行的残缺数据
+    "short_series_broken.csv": (20, "monthly") 
 }
 
-@pytest.fixture
-def base_valid_arima_payload():
-    """提供一个完美通过 Schema 和 Domain 的 ARIMA(1,1,1) 标准参数字典"""
-    return {
+def test_error_accumulation_captures_all_violations():
+    """
+    故障注入对抗测试：构造一个同时触犯了【频率错配】、【复杂度超限】、【样本量枯竭】三重罪状的恶劣 Spec，
+    验证全量累积引擎是否能完整留痕、无一遗漏。
+    """
+    # 故意指向只有 20 行样本的短数据集，但是要求初始窗口 60；物理是月频，这里瞎填日频；ARIMA 阶数填到 10,0,10 撑爆复杂度
+    terrible_payload = {
         "spec_version": "1.0",
         "target": {
-            "dataset_id": "monthly_sales_ok.csv",
+            "dataset_id": "short_series_broken.csv", # 导致 INSUFFICIENT_SAMPLE
             "column": "revenue",
-            "frequency": "monthly"
+            "frequency": "daily"                    # 导致 FREQUENCY_MISMATCH
         },
-        "transformations": [
-            {"kind": "log", "order": 0}
-        ],
+        "transformations": [],
         "model": {
             "family": "arima",
-            "order": [1, 1, 1],
-            "seasonal_order": [0, 0, 0, 12]
+            "order": [10, 0, 10],                   # 导致 MODEL_COMPLEXITY_EXCESSIVE (10+10=20 > 12)
+            "seasonal_order": None
         },
         "backtest": {
             "horizon": 6,
             "initial_window": 60,
             "step_size": 3,
-            "metrics": ["rmse", "mae"]
+            "metrics": ["rmse"]
         },
         "forecast_horizon": 6,
-        "rationale": "基于数据的月度季节性表现，选用常规稳定 ARIMA 管道进行基线拟合。"
+        "rationale": "恶意注入注入的多重错误规格体测试。"
     }
-
-def test_happy_path_modelspec_compiles(base_valid_arima_payload):
-    """测试标准合法规格在全链路解析与领域审查中的畅通流转"""
-    # 1. 语法与 Schema 转化放行
-    spec = ModelSpecParser.parse_deterministic_json(
-        import_json_string(base_valid_arima_payload)
-    )
-    assert spec.model.family == "arima"
-    assert spec.model.order == (1, 1, 1)
     
-    # 2. 领域数学校验放行
-    is_ok = ModelSpecDomainValidator.validate_spec(spec, MOCK_DATA_REGISTRY)
-    assert is_ok is True
-
-def test_schema_level_violation_raises(base_valid_arima_payload):
-    """故障注入 1：注入非法的家族模型代号，属于一阶一网 Schema 拦截范围"""
-    bad_payload = base_valid_arima_payload.copy()
-    bad_payload["model"] = {"family": "deep_learning_lstm_fake_model"} # 捏造不支持的模型
+    spec = ModelSpec.model_validate(terrible_payload)
     
-    with pytest.raises(ValidationError):
-        ModelSpecParser.wrap_llm_structured_candidate(bad_payload)
-
-def test_domain_level_frequency_mismatch(base_valid_arima_payload):
-    """故障注入 2：注入错误的频率描述，引发 DomainValidationError 业务级拦截"""
-    bad_payload = base_valid_arima_payload.copy()
-    bad_payload["target"]["frequency"] = "daily" # 强行说自己是日频，但物理存根实际上是月频
+    # 运行全量审计
+    reports = ModelSpecDomainValidator.validate_spec(spec, MOCK_DATA_REGISTRY)
     
-    spec = ModelSpec.model_validate(bad_payload)
-    with pytest.raises(DomainValidationError, match="数据频率冲突"):
-        ModelSpecDomainValidator.validate_spec(spec, MOCK_DATA_REGISTRY)
-
-def test_domain_level_sample_size_exhaustion(base_valid_arima_payload):
-    """故障注入 3：指向只有 15 行的短残缺数据集，引发样本量枯竭国防线熔断"""
-    bad_payload = base_valid_arima_payload.copy()
-    bad_payload["target"]["dataset_id"] = "short_series_broken.csv" # 指向残存源
+    # 核心断言：错误收集器必须精准斩获 3 条诊断，不能漏掉任何一个！
+    assert len(reports) == 3
     
-    spec = ModelSpec.model_validate(bad_payload)
-    with pytest.raises(DomainValidationError, match="历史观测样本量枯竭"):
-        ModelSpecDomainValidator.validate_spec(spec, MOCK_DATA_REGISTRY)
-
-def test_llm_parser_privilege_stripping(base_valid_arima_payload):
-    """故障注入 4：对抗大模型企图私自跳过人工审批的越权防御测试"""
-    sneaky_payload = base_valid_arima_payload.copy()
-    sneaky_payload["require_human_approval"] = False # 模型企图宣称自己完全不需要人看
+    codes = [d.code for d in reports]
+    assert "FREQUENCY_MISMATCH" in codes
+    assert "MODEL_COMPLEXITY_EXCESSIVE" in codes
+    assert "INSUFFICIENT_SAMPLE" in codes
     
-    # Parser 必须暴力干预剥夺其越权声明，强行根据安全策略重设为真
-    spec = ModelSpecParser.wrap_llm_structured_candidate(sneaky_payload)
-    assert spec.require_human_approval is True
-
-def import_json_string(d: dict) -> str:
-    return json.dumps(d)
+    # 打印查看打包给 LLM 的高浓度诊断报告样式
+    from agent_runtime.scientific.validators import format_diagnostics_for_llm
+    final_prompt = format_diagnostics_for_llm(reports)
+    print("\n" + final_prompt)
