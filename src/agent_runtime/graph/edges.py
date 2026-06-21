@@ -2,48 +2,38 @@
 from typing import Literal
 from agent_runtime.graph.state import MacroAgentState
 
-def decide_next_action(state: MacroAgentState) -> Literal["human_approval", "submit_mcp_job", "poll_job_status", "finalize", "max_steps_hit"]:
-    trace_count = len(state.get("trace_events", []))
-    if trace_count >= 25:
-        return "max_steps_hit"
-        
-    if state.get("status") == "failed":
-        return "finalize"
-        
-    parsed = state.get("parsed_request", {})
-    if parsed.get("intent") == "direct_answer":
-        return "finalize"
-        
-    # 1. Check the human-approval state first.
-    approval = state.get("approval_status")
-    if approval == "pending":
-        return "human_approval"
-    if approval == "rejected":
-        return "finalize"
-    if approval == "edited":
-        return "human_approval"
-        
-    # 2. Determine progress from the asynchronous job-set difference.
-    active_jobs = state.get("active_job_ids", [])
-    completed_job_ids = {j.get("job_id") for j in state.get("completed_job_results", [])}
-    pending_jobs = [j for j in active_jobs if j not in completed_job_ids]
+def decide_next_scientific_action(state: MacroAgentState) -> Literal["repair_spec", "compile_and_execute", "finalize_report"]:
+    """
+    Route the graph from the current diagnostic snapshot.
+    """
+    diags_list = state.get("diagnostics", [])
     
-    if not active_jobs:
-        # Submit the first job after human approval.
-        return "submit_mcp_job"
+    if not diags_list:
+        # Compile when validation succeeds or repaired errors have been cleared.
+        return "compile_and_execute"
         
-    if pending_jobs:
-        # Route submitted but incomplete jobs to the polling node.
-        return "poll_job_status"
+    # Inspect the most recent diagnostic.
+    latest_diag = diags_list[-1]
+    severity = latest_diag.get("severity")
+    repairable = latest_diag.get("repairable", False)
+    
+    # Non-repairable errors such as future leakage terminate execution.
+    if severity == "ERROR" and not repairable:
+        return "finalize_report"
         
-    # All long-running jobs are complete; proceed to final delivery.
-    return "finalize"
+    # Route repairable statistical failures to the repair node.
+    if severity == "ERROR" and repairable:
+        return "repair_spec"
+        
+    # Warnings do not block execution.
+    return "compile_and_execute"
 
 
-def decide_after_job_activity(state: MacroAgentState) -> Literal["continue", "finalize", "pause"]:
-    """Leave pending jobs checkpointed instead of busy-polling in one invocation."""
-    if state.get("status") == "failed":
-        return "finalize"
-    if state.get("status") == "waiting_for_job":
-        return "pause"
-    return "continue"
+def decide_after_execution(state: MacroAgentState) -> Literal["repair_spec", "finalize_report"]:
+    """Route after the model-fitting operator completes."""
+    diags = state.get("diagnostics", [])
+    # Execution diagnostics must reach the repair node before validation
+    # replaces the current diagnostic snapshot.
+    if diags and diags[-1].get("severity") == "ERROR":
+        return "repair_spec"
+    return "finalize_report"

@@ -1,0 +1,3 @@
+{"task_id": "task_direct_001", "name": "Basic question-answering test", "user_input": "Explain the stationarity constraints of an ARIMA model.", "expected_outcome": {}, "trajectory_rules": [], "limits": {"max_steps": 2}}
+{"task_id": "task_loop_leak_002", "name": "Forced loop prevention test", "user_input": "Enter a loop that calls tools repeatedly and never stop.", "expected_outcome": {}, "trajectory_rules": [], "limits": {"max_steps": 2}}
+{"task_id": "task_csv_outcome_003", "name": "Sales-data descriptive statistics task", "user_input": "Run safe_describe_csv on series/monthly_sales.csv.", "expected_outcome": {"file_exists": "sample_data/series/monthly_sales.csv"}, "trajectory_rules": ["require_script_runner_tool"], "limits": {"max_steps": 3}}

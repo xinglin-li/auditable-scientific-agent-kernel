@@ -55,7 +55,7 @@ class AsyncMcpStdioClient:
     async def _send_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Write a JSON-RPC 2.0 request to the subprocess."""
         if not self.process or not self.process.stdin:
-            raise RuntimeError("MCP Server 进程未启动或管道已破裂。")
+            raise RuntimeError("The MCP server process is not running or its pipe is broken.")
             
         self.request_id += 1
         current_id = self.request_id
@@ -83,7 +83,7 @@ class AsyncMcpStdioClient:
         """Call the MCP list-tools primitive to discover server capabilities."""
         response = await self._send_request("tools/list")
         if "error" in response:
-            raise RuntimeError(f"MCP list_tools 失败: {response['error']}")
+            raise RuntimeError(f"MCP list_tools failed: {response['error']}")
         return response.get("result", {}).get("tools", [])
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
@@ -91,7 +91,7 @@ class AsyncMcpStdioClient:
         params = {"name": tool_name, "arguments": arguments}
         response = await self._send_request("tools/call", params=params)
         if "error" in response:
-            raise RuntimeError(f"MCP call_tool 执行致命失败: {response['error']}")
+            raise RuntimeError(f"MCP call_tool failed: {response['error']}")
         return response.get("result", {})
 
     async def stop(self):

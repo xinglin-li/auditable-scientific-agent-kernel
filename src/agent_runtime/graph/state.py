@@ -18,6 +18,15 @@ class MacroAgentState(TypedDict, total=False):
     context_bundle: dict
     selected_skills: List[str]
     
+    # -- Strongly typed state for auditable scientific modeling --
+    model_spec: Any                 # Strongly typed ModelSpec IR instance.
+    execution_plan: Any             # Strongly typed ExecutionPlan IR instance.
+    # Current active diagnostics use replacement semantics so a successful
+    # re-validation can clear errors consumed by the repair node.
+    diagnostics: List[dict]
+    repair_history: Annotated[List[dict], reduce_append]  # Audit trail of bounded repair diffs.
+    repair_attempts: int            # Current repair-attempt count.
+    
     # -- Analysis plan and exclusive state-machine position (latest edit overrides) --
     analysis_plan: dict
     plan_status: Literal["not_started", "drafted", "approved", "executing", "done"]
