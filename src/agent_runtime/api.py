@@ -13,13 +13,13 @@ from agent_runtime.tools.arithmetic import AddNumbersTool
 from agent_runtime.providers.fake_provider import FakeProvider
 from agent_runtime.models import AgentMessage
 
-# 增量并入 Day 4 所需的强类型及评测核心
+# Strongly typed evaluation components added for Day 4.
 from agent_runtime.evals.models import EvalTask
 from agent_runtime.evals.runner import AsyncEvalRunner
 
 app = FastAPI(title="AI Agent Runtime Service", version="1.0.0")
 
-# 保持原有内存数据库资产
+# Preserve the existing in-memory run store.
 RUNS_DATABASE: Dict[str, AgentState] = {}
 ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
 
@@ -38,7 +38,7 @@ class RunSummaryResponse(BaseModel):
     step_count: int
     final_answer: Optional[str] = None
 
-# ==================== REST Routes (保持老资产 100% 连通) ====================
+# ==================== REST routes (backward compatible) ====================
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 def health_check():
@@ -76,31 +76,32 @@ def get_run_status(run_id: str):
     state = RUNS_DATABASE[run_id]
     return RunSummaryResponse(run_id=state.run_id, status=state.status, step_count=state.step_count, final_answer=state.final_answer)
 
-# ==================== 新增：微服务异步流式评测核心路由 ====================
+# ==================== Asynchronous streaming evaluation route ====================
 
 class EvalSuiteExecutionRequest(BaseModel):
-    """批量评测套件请求契约"""
-    tasks: List[EvalTask] = Field(..., min_length=1, description="标准黄金测试用例列表")
-    num_trials: int = Field(2, ge=1, description="每个 Task 的重复 Trial 次数")
-    initial_concurrency: int = Field(3, ge=1, description="初始并发窗口上限")
+    """Request contract for executing a batch evaluation suite."""
+    tasks: List[EvalTask] = Field(..., min_length=1, description="Golden evaluation tasks")
+    num_trials: int = Field(2, ge=1, description="Number of repetitions per task")
+    initial_concurrency: int = Field(3, ge=1, description="Initial concurrency limit")
 
 def api_runtime_factory_wrapper():
-    """工厂闭包：用于隔离拉起干净的单次测试 Runtime 实例"""
-    # 模拟通用评测响应
+    """Create a clean, isolated runtime for each evaluation trial."""
+    # Simulate a generic evaluation response.
     responses = [AgentMessage(role="assistant", content="ARIMA model specs calculated. Passed.")]
     return AgentRuntime(provider=FakeProvider(responses), tool_registry=get_configured_registry())
 
 @app.post("/api/v1/evals/run")
 async def run_eval_suite_stream(payload: EvalSuiteExecutionRequest) -> StreamingResponse:
     """
-    生产级微服务核心：接收全量评测数据集，并行驱动沙箱，并通过标准 SSE 数据流实时向客户端推送审计留痕
+    Run an evaluation dataset concurrently and stream audit events to the
+    client using the standard SSE protocol.
     """
     runner = AsyncEvalRunner(
         runtime_factory=api_runtime_factory_wrapper,
         initial_concurrency=payload.initial_concurrency
     )
     
-    # 强行指定媒体类型为 text/event-stream 激活前端流式监听器
+    # Use the SSE media type so clients can consume the response incrementally.
     return StreamingResponse(
         runner.stream_suite_evaluation(payload.tasks, num_trials=payload.num_trials),
         media_type="text/event-stream",

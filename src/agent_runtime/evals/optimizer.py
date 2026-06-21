@@ -4,42 +4,43 @@ from pydantic import BaseModel
 from agent_runtime.evals.failure_episode import FailureEpisode
 
 class CandidatePatch(BaseModel):
-    """引发智能体行为修正的补丁实体"""
+    """Patch that modifies agent behavior."""
     patch_id: str
     target_node: str
-    injected_instruction: str  # 动态注入的防御性 Prompt 指令
+    injected_instruction: str  # Defensive prompt instruction injected at runtime.
 
 class ReflexionOptimizer:
-    """自动化离线诊断与 Prompt 补丁生成引擎"""
+    """Generate prompt patches from offline failure diagnostics."""
     
     def __init__(self, domain_knowledge_base: Dict[str, str] = None):
         self.knowledge_base = domain_knowledge_base or {
-            "max_steps_exceeded_failure": "【防死循环策略】你已经连续多次尝试相同工具。请立刻停止重复调用，如果无法获取新数据，请直接输出 Final Answer 说明局限性。",
-            "tool_argument_failure": "【强类型规约】调用工具前，必须严格核对 Schema 定义的字段类型，禁止捏造参数。"
+            "max_steps_exceeded_failure": "[LOOP PREVENTION] You have attempted the same tool repeatedly. Stop retrying and return a final answer that explains the limitation if no new data is available.",
+            "tool_argument_failure": "[STRICT TYPING] Validate every tool argument against its schema before calling the tool. Never invent arguments."
         }
 
     def diagnose_and_suggest(self, episode: FailureEpisode) -> CandidatePatch:
         """
-        高浓度根因推演：不看海量噪音，只基于结构化失败片段进行精准定点修复
+        Diagnose root causes from compact structured failure records instead
+        of loading the full noisy context.
         """
         ftype = episode.failure_type
         failed_node = episode.failed_node or "agent_core"
         
-        # 寻找对应的专家防御策略
+        # Select the matching defensive strategy.
         instruction = self.knowledge_base.get(
             ftype, 
-            "【通用防御】运行时遭遇未知崩溃，请退回到安全节点并检查输入边界。"
+            "[GENERAL DEFENSE] An unknown runtime failure occurred. Return to a safe node and validate input boundaries."
         )
         
-        # 组装动态自修复补丁
+        # Build the dynamic repair patch.
         patch = CandidatePatch(
             patch_id=f"patch_{episode.task_id}_{ftype}",
             target_node=failed_node,
             injected_instruction=instruction
         )
         
-        # 将建议回写沉淀到资产实体的候选池中，完成审计留痕
+        # Persist the suggestion in the episode for auditability.
         episode.candidate_patches.append(patch.injected_instruction)
-        episode.root_cause_hypothesis = f"诊断报告：检测到类型为 [{ftype}] 的失效。根因在于模型在 [{failed_node}] 节点未能正确收敛。"
+        episode.root_cause_hypothesis = f"Diagnostic report: detected failure type [{ftype}]. The model failed to converge at node [{failed_node}]."
         
         return patch

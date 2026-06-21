@@ -5,15 +5,15 @@ from typing import List
 from agent_runtime.evals.models import EvalTask
 
 class EvalDatasetLoader:
-    """确定性数据集加载与强校验引擎"""
+    """Load evaluation datasets deterministically with strict validation."""
     
     @staticmethod
     def load_jsonl(file_path: str) -> List[EvalTask]:
-        """流式加载并逐行通过 Pydantic 校验固化为 EvalTask"""
+        """Stream a JSONL file and validate each row as an EvalTask."""
         tasks = []
         path = Path(file_path)
         if not path.exists():
-            raise FileNotFoundError(f"评估数据集文件未找到: {file_path}")
+            raise FileNotFoundError(f"Evaluation dataset not found: {file_path}")
             
         with open(path, "r", encoding="utf-8") as f:
             for line_idx, line in enumerate(f, start=1):
@@ -24,7 +24,7 @@ class EvalDatasetLoader:
                     data = json.loads(cleaned_line)
                     tasks.append(EvalTask.model_validate(data))
                 except Exception as e:
-                    # 强力拦截：直接指出具体哪一行发生 Schema 损坏，防止脏数据入库
-                    raise ValueError(f"数据集解析致命错误 [文件: {path.name} | 第 {line_idx} 行]: {str(e)}")
+                    # Identify the invalid row precisely and reject malformed data.
+                    raise ValueError(f"Fatal dataset parsing error [file: {path.name} | line: {line_idx}]: {str(e)}")
                     
         return tasks

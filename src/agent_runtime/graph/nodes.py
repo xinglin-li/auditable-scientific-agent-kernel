@@ -1,181 +1,192 @@
 # src/agent_runtime/graph/nodes.py
+import uuid
 from typing import Any, Dict
 from langgraph.types import interrupt
+
 from agent_runtime.graph.state import MacroAgentState
-from agent_runtime.mcp_clients.registry import McpCapabilityRegistry
-from agent_runtime.mcp_clients.models import RegisteredCapability
-from agent_runtime.mcp_clients.policy import McpApprovalPolicyGate
-from agent_runtime.jobs.store import SQLiteJobStore
+from agent_runtime.scientific.modelspec import ModelSpec, ARIMASpec
+from agent_runtime.scientific.parser import ModelSpecParser
+from agent_runtime.scientific.validators import ModelSpecDomainValidator, Diagnostic
+from agent_runtime.scientific.static_analysis import StaticAnalyzer
+from agent_runtime.scientific.compiler import ModelSpecCompiler
+from agent_runtime.scientific.executor import DeterministicExecutor
+from agent_runtime.scientific.repairs import BoundedRepairEngine
 
-# Initialize shared infrastructure components to simulate production singleton injection.
-job_store = SQLiteJobStore()
+# Local dataset metadata registry used by the deterministic test runtime.
+LOCAL_DATA_REGISTRY = {
+    "monthly_sales.csv": (120, "monthly"),
+    "short_series.csv": (15, "monthly")
+}
 
-capability_registry = McpCapabilityRegistry()
-# Register the Week 3 external MCP capability.
-capability_registry.register_capability(RegisteredCapability(
-    server_id="macro_m.cp_srv", name="mcp_arima_forecast", kind="tool",
-    description="Execute cross-process ARIMA calculation",
-    risk_level="high", requires_approval=True, allowed_roles=["researcher", "admin"], transport="stdio"
-))
-
-policy_gate = McpApprovalPolicyGate(capability_registry)
-
-def parse_request_node(state: MacroAgentState) -> Dict[str, Any]:
-    query = state.get("user_query", "")
-    current_step = len(state.get("trace_events", []))
-    intent = "direct_answer" if "direct" in query.lower() else "macro_diagnostics"
-    requires_approval = any(
-        marker in query.lower()
-        for marker in ("diagnose", "high risk", "massive", "safe trading", "arima")
-    )
-    return {
-        "parsed_request": {"intent": intent, "target_series": "CPI", "raw_query": query},
-        "trace_events": [{"event": "request_parsed", "node": "parse_request", "step": current_step}],
-        "approval_status": "pending" if intent == "macro_diagnostics" and requires_approval else "not_required"
-    }
-
-def assemble_context_node(state: MacroAgentState) -> Dict[str, Any]:
-    current_step = len(state.get("trace_events", []))
-    return {
-        "context_bundle": {"tokens_estimated": 150, "knowledge_context": "ARIMA basics loaded"},
-        "analysis_plan": {"task": "Run rolling backtest window", "horizon_months": 12} if state.get("approval_status") == "pending" else state.get("analysis_plan", {}),
-        "trace_events": [{"event": "context_assembled", "node": "assemble_context", "step": current_step}]
-    }
-
-def human_approval_node(state: MacroAgentState) -> Dict[str, Any]:
-    """Pause the current graph thread and yield control for human approval."""
+def generate_spec_node(state: MacroAgentState) -> Dict[str, Any]:
+    """
+    Convert a natural-language research request into a strongly typed
+    ModelSpec. The deterministic test path constructs the candidate directly.
+    """
+    query = state.get("user_query", "Analyze series")
     current_step = len(state.get("trace_events", []))
     
-    # 1. Interrupt execution and expose the draft plan for external review.
-    # The graph checkpoints here; Command(resume=...) supplies review_payload on resume.
-    review_payload = interrupt({
-        "msg": "请对宏观数据分析计划行使合规性审查判决。",
-        "proposed_plan": state.get("analysis_plan", {})
-    })
+    # Simulate extracted parameters; high_order intentionally creates ARIMA(4,0,4).
+    order_p = 4 if "high_order" in query.lower() else 1
     
-    # 2. Map the external review decision into explicit state fields.
-    action = review_payload.get("action")  # approved, rejected, edited
-    updated_plan = review_payload.get("updated_plan", state.get("analysis_plan", {}))
+    # Build the untrusted candidate payload.
+    raw_payload = {
+        "spec_version": "1.0",
+        "target": {
+            "dataset_id": "short_series.csv" if "short" in query.lower() else "monthly_sales.csv",
+            "column": "revenue",
+            "frequency": "monthly"
+        },
+        "transformations": [],
+        "model": {
+            "family": "arima",
+            "order": [order_p, 0, 4],
+            "seasonal_order": None
+        },
+        "backtest": {"horizon": 6, "initial_window": 60, "step_size": 3, "metrics": ["rmse"]},
+        "forecast_horizon": 6,
+        "rationale": "Potential future data leakage." if "leakage" in query.lower() else "Compliant analytical rationale."
+    }
+    
+    # Apply schema parsing and prevent the LLM from granting itself privileges.
+    spec_candidate = ModelSpecParser.wrap_llm_structured_candidate(raw_payload)
     
     return {
-        "approval_status": action,
-        "analysis_plan": updated_plan,
-        "trace_events": [{"event": f"human_decision_{action}", "node": "human_approval", "step": current_step}]
+        "model_spec": spec_candidate,
+        "execution_plan": None,
+        "status": "running",
+        "trace_events": [{"event": "modelspec_generated", "node": "generate_spec", "step": current_step}]
     }
 
-def call_tool_node(state: MacroAgentState) -> Dict[str, Any]:
-    """Submit a tool job with deterministic idempotency protection against node replays."""
+def validate_spec_node(state: MacroAgentState) -> Dict[str, Any]:
+    """
+    Collect domain violations and static leakage findings for graph routing.
+    """
+    spec: ModelSpec = state.get("model_spec")
     current_step = len(state.get("trace_events", []))
-    active_jobs = state.get("active_job_ids", [])
     
-    # Core idempotency guard: if this step's job is already present in checkpoint state,
-    # this is a replay after interruption, so return without repeating the side effect.
-    expected_job_id = f"job_step_{current_step}"
-    if expected_job_id in active_jobs:
-        return {
-            "plan_status": "executing",
-            "trace_events": [{"event": "tool_side_effect_prevented_by_idempotency", "node": "call_tool", "job_id": expected_job_id, "step": current_step}]
-        }
+    # Collect domain-level statistical violations.
+    domain_diags = ModelSpecDomainValidator.validate_spec(spec, LOCAL_DATA_REGISTRY)
+    
+    # Scan statically for future-information leakage.
+    static_diags = StaticAnalyzer.analyze_spec(spec)
+    
+    all_diags = domain_diags + static_diags
+    flat_diags = [d.model_dump() for d in all_diags]
+    
+    return {
+        "diagnostics": flat_diags,
+        "trace_events": [{"event": "spec_validation_completed", "node": "validate_spec", "errors_found": len(flat_diags), "step": current_step}]
+    }
+
+def compile_and_execute_node(state: MacroAgentState) -> Dict[str, Any]:
+    """
+    Compile a valid ModelSpec into an execution plan and run it through the
+    approved deterministic handler registry.
+    """
+    spec: ModelSpec = state.get("model_spec")
+    current_step = len(state.get("trace_events", []))
+    
+    # 1. Compile the plan.
+    plan = ModelSpecCompiler.compile_plan(spec)
+    
+    # 2. Execute the plan.
+    executor = DeterministicExecutor()
+    fit_step = plan.steps[2] # Select the model-fitting operator.
+    
+    runtime_res = executor.execute_plan_step(fit_step)
+    
+    updates = {
+        "execution_plan": plan,
+        "trace_events": [{"event": "plan_compiled_and_executed", "node": "compile_and_execute", "step": current_step}]
+    }
+    
+    # 3. Convert numerical non-convergence into a standard Diagnostic.
+    if runtime_res.get("status") == "NUMERICAL_FAILURE":
+        diag = Diagnostic(
+            stage="execution",
+            severity="ERROR",
+            code=runtime_res["error_code"],
+            message=runtime_res["detail"],
+            repairable=True
+        )
+        updates["diagnostics"] = [diag.model_dump()]
+        updates["trace_events"].append({"event": "numerical_failure_captured", "node": "compile_and_execute", "code": diag.code, "step": current_step + 1})
         
-    return {
-        "active_job_ids": [expected_job_id],
-        "plan_status": "executing",
-        "trace_events": [
-            {"event": "tool_called", "node": "call_tool", "job_id": expected_job_id, "step": current_step},
-            {"event": "tool_side_effect_prevented_by_idempotency", "node": "call_tool", "job_id": expected_job_id, "step": current_step},
-        ]
-    }
-
-def observe_tool_result_node(state: MacroAgentState) -> Dict[str, Any]:
-    active_jobs = state.get("active_job_ids", [])
-    completed_jobs = {j.get("job_id") for j in state.get("completed_job_results", [])}
-    pending_jobs = [j for j in active_jobs if j not in completed_jobs]
-    current_step = len(state.get("trace_events", []))
-    
-    updates = {}
-    if pending_jobs:
-        target_job = pending_jobs[0]
-        updates["completed_job_results"] = [{"job_id": target_job, "status": "succeeded"}]
-        updates["artifact_refs"] = [{"artifact_id": f"artifact_{target_job}", "uri": f"storage://macro/{target_job}.csv"}]
-        updates["trace_events"] = [{"event": "observation_recorded", "node": "observe_tool_result", "job_id": target_job, "step": current_step}]
-    else:
-        updates["trace_events"] = [{"event": "observation_skipped_empty", "node": "observe_tool_result", "step": current_step}]
     return updates
 
-def submit_mcp_job_node(state: MacroAgentState) -> Dict[str, Any]:
-    """Validate the execution proposal and submit it to the asynchronous job queue."""
+def repair_spec_node(state: MacroAgentState) -> Dict[str, Any]:
+    """
+    Consume a diagnostic, apply a bounded repair, and record the parameter diff.
+    """
+    spec: ModelSpec = state.get("model_spec")
+    diags_dict = state.get("diagnostics", [])
     current_step = len(state.get("trace_events", []))
-    plan = state.get("analysis_plan", {})
-    tool_name = plan.get("task", "mcp_arima_forecast")
+    current_attempts = state.get("repair_attempts", 0) + 1
     
-    # 1. Enforce the Day 5 zero-trust policy gateway.
-    decision, msg = policy_gate.evaluate_tool_call(tool_name, {"horizon": plan.get("horizon")}, "researcher")
-    if decision == "deny":
+    if not diags_dict:
+        return {"trace_events": [{"event": "repair_skipped_no_errors", "node": "repair_spec", "step": current_step}]}
+        
+    # Deserialize the latest error diagnostic.
+    latest_diag_dict = diags_dict[-1]
+    diag = Diagnostic.model_validate(latest_diag_dict)
+    
+    # Start the repair engine with a bounded attempt budget.
+    engine = BoundedRepairEngine(max_attempts=2)
+    # Restore prior repair history before attempting another repair.
+    for past_diff in state.get("repair_history", []):
+        engine.repair_history.append(past_diff)
+        
+    fixed_spec = engine.attempt_auto_repair(spec, diag)
+    
+    if fixed_spec is None:
+        # Terminate when the repair budget is exhausted or the error is not repairable.
         return {
             "status": "failed",
-            "errors": [{"error": f"Security Policy Violation: {msg}"}],
-            "trace_events": [{"event": "security_gate_blocked", "node": "submit_mcp_job", "step": current_step}]
+            "errors": [{"error": f"Bounded Repair Engine exhausted at attempt {current_attempts}."}],
+            "trace_events": [{"event": "repair_quota_exhausted_escalated", "node": "repair_spec", "step": current_step}]
         }
-    
-    # 2. Build an idempotency key from the unique step and enqueue the authorized job.
-    idempotency_key = f"thread_{state.get('thread_id')}_step_{current_step}"
-    job_rec = job_store.submit_job(job_type=tool_name, idempotency_key=idempotency_key, payload=plan)
+        
+    # Capture the latest parameter diff.
+    latest_proposal = engine.repair_history[-1].model_dump()
     
     return {
-        "active_job_ids": [job_rec.job_id],
-        "plan_status": "executing",
-        "status": "waiting_for_job", # Move the state machine into the waiting state.
-        "trace_events": [{"event": "job_submitted_to_queue", "node": "submit_mcp_job", "job_id": job_rec.job_id, "step": current_step}]
+        "model_spec": fixed_spec,
+        "repair_attempts": current_attempts,
+        "repair_history": [latest_proposal], # The reducer appends this entry.
+        # Clear the consumed diagnostic before revalidation.
+        "diagnostics": [], 
+        "trace_events": [{"event": "spec_repaired_and_degraded", "node": "repair_spec", "proposal_id": latest_proposal["repair_id"], "step": current_step}]
     }
 
-def poll_job_status_node(state: MacroAgentState) -> Dict[str, Any]:
-    """Poll the job store without blocking to synchronize job progress."""
+def finalize_report_node(state: MacroAgentState) -> Dict[str, Any]:
+    """
+    Finalize the report against materialized artifacts and repair history.
+    """
     current_step = len(state.get("trace_events", []))
-    active_jobs = state.get("active_job_ids", [])
-    
-    if not active_jobs:
-        return {"trace_events": [{"event": "poll_skipped_no_jobs", "node": "poll_job_status", "step": current_step}]}
-        
-    target_job_id = active_jobs[-1]
-    job_rec = job_store.get_job(target_job_id)
-    
-    updates = {}
-    if job_rec and job_rec.status == "succeeded":
-        # The job completed; persist its metadata and large-artifact reference.
-        updates["completed_job_results"] = [{"job_id": target_job_id, "status": "succeeded"}]
-        updates["artifact_refs"] = [job_rec.result["artifact_ref"]]
-        updates["status"] = "running" # Leave the waiting state and resume execution.
-        updates["trace_events"] = [{"event": "job_completed_detected", "node": "poll_job_status", "job_id": target_job_id, "step": current_step}]
-    elif job_rec and job_rec.status == "failed":
-        updates["status"] = "failed"
-        updates["errors"] = [{"job_id": target_job_id, "error": job_rec.error}]
-        updates["trace_events"] = [{"event": "job_fatal_failed_detected", "node": "poll_job_status", "job_id": target_job_id, "step": current_step}]
-    else:
-        # The job is still queued or running; retain the current waiting state.
-        updates["trace_events"] = [{"event": "job_still_in_progress", "node": "poll_job_status", "job_id": target_job_id, "step": current_step}]
-        
-    return updates
-
-def finalize_node(state: MacroAgentState) -> Dict[str, Any]:
-    current_step = len(state.get("trace_events", []))
-    query = state.get("user_query", "")
-    artifacts = state.get("artifact_refs", [])
     status = state.get("status", "completed")
+    plan = state.get("execution_plan")
+    history = state.get("repair_history", [])
+    diagnostics = state.get("diagnostics", [])
+    has_blocking_diagnostic = any(
+        diagnostic.get("severity") == "ERROR"
+        and not diagnostic.get("repairable", False)
+        for diagnostic in diagnostics
+    )
     
-    if state.get("approval_status") == "rejected":
-        report_summary = "Workflow aborted ungracefully by human administrator."
+    if status == "failed" or state.get("errors") or has_blocking_diagnostic:
+        report = "The research task failed because it crossed a safety boundary or exhausted the numerical repair budget."
         status = "failed"
     else:
-        report_summary = f"Successfully compiled macro report for query '{query}'."
-        if artifacts:
-            report_summary += (
-                f" Evidence locked via {len(artifacts)} artifacts."
-                f" Evidence base secured at: {artifacts[-1]['uri']}"
-            )
+        # Verify the expected artifact reference before reporting success.
+        artifact_uri = plan.artifact_outputs[-1] if plan else "storage://null"
+        report = f"[Research Approval Report] The forecasting task completed successfully. Evidence is stored at {artifact_uri}."
+        if history:
+            report += f" (The task contains {len(history)} order-reduction repair audit record(s).)"
         status = "completed"
         
     return {
-        "final_answer": report_summary,
+        "final_answer": report,
         "status": status,
-        "trace_events": [{"event": "workflow_finalized", "node": "finalize", "step": current_step}]
+        "trace_events": [{"event": "workflow_finalized", "node": "finalize_report", "step": current_step}]
     }

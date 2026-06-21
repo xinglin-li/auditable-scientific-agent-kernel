@@ -11,7 +11,7 @@ from agent_runtime.models import AgentMessage, ToolCall
 from agent_runtime.runtime.loop import AgentRuntime
 
 def test_dataset_loader_and_schema_enforcement(tmp_path):
-    """测试数据集解析引擎是否能精准识别脏数据与标准加载"""
+    """Verify that the dataset loader accepts valid rows and rejects malformed data."""
     good_file = tmp_path / "good.jsonl"
     good_file.write_text(
         '{"task_id": "t1", "name": "N", "user_input": "Q", "expected_outcome": {}, "trajectory_rules": [], "limits": {}}\n',
@@ -27,9 +27,9 @@ def test_dataset_loader_and_schema_enforcement(tmp_path):
         EvalDatasetLoader.load_jsonl(str(bad_file))
 
 def test_harness_trial_isolation_and_failure_capture():
-    """验证 Harness 在执行任务时是否做到了状态绝对隔离，并能精准捕获死循环故障"""
+    """Verify trial isolation and detection of a non-terminating tool loop."""
     
-    # 模拟一个会故意引发死循环（不断抛出 tool_call）的有害 Assistant 响应
+    # Simulate an assistant that repeatedly emits the same tool call.
     loop_responses = [
         AgentMessage(role="assistant", tool_calls=[ToolCall(call_id="c", tool_name="add_numbers", arguments={"a": 1, "b": 1})]),
         AgentMessage(role="assistant", tool_calls=[ToolCall(call_id="c", tool_name="add_numbers", arguments={"a": 1, "b": 1})]),
@@ -37,10 +37,10 @@ def test_harness_trial_isolation_and_failure_capture():
     ]
     
     def mock_runtime_factory():
-        # 每次实例化全新的干净容器
+        # Create a clean container for every trial.
         reg = ToolRegistry()
         reg.register(AddNumbersTool())
-        # 注意：每次都要重新复制一份，否则 pop() 会导致多 trial 共享状态污染
+        # Copy responses because pop() would otherwise leak state across trials.
         prov = FakeProvider(list(loop_responses))
         return AgentRuntime(provider=prov, tool_registry=reg)
 
@@ -49,12 +49,12 @@ def test_harness_trial_isolation_and_failure_capture():
     from agent_runtime.evals.models import EvalTask
     mock_task = EvalTask(
         task_id="task_test_loop",
-        name="测试死循环边界",
-        user_input="测试",
-        limits={"max_steps": 2} # 强行限流
+        name="Test loop boundary",
+        user_input="Test",
+        limits={"max_steps": 2} # Enforce a small step budget.
     )
     
-    # 跑 2 次独立试炼
+    # Run two independent trials.
     results = harness.run_task_suite([mock_task], num_trials=2)
     assert len(results) == 2
     
